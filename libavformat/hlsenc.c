@@ -44,6 +44,7 @@ typedef struct HLSContext {
     AVFormatContext *avf;
     float time;            // Set by a private option.
     int  size;             // Set by a private option.
+    int  payload_size;     // Set by a private option.
     int  wrap;             // Set by a private option.
     int64_t recording_time;
     int has_video;
@@ -77,6 +78,12 @@ static int hls_mux_init(AVFormatContext *s)
         avcodec_copy_context(st->codec, s->streams[i]->codec);
         st->sample_aspect_ratio = s->streams[i]->sample_aspect_ratio;
     }
+
+    assert(!oc->priv_data);
+    oc->priv_data = av_mallocz(oc->oformat->priv_data_size);
+    *(const AVClass **)oc->priv_data = oc->oformat->priv_class;
+    av_opt_set_defaults(oc->priv_data);
+    oc->max_delay = s->max_delay;
 
     return 0;
 }
@@ -162,6 +169,7 @@ static int hls_start(AVFormatContext *s)
 {
     HLSContext *c = s->priv_data;
     AVFormatContext *oc = c->avf;
+    void * odata = oc->priv_data;
     int err = 0;
 
     if (c->wrap)
@@ -177,9 +185,14 @@ static int hls_start(AVFormatContext *s)
                           &s->interrupt_callback, NULL)) < 0)
         return err;
 
-    if (oc->oformat->priv_class && oc->priv_data)
-        av_opt_set(oc->priv_data, "mpegts_flags", "resend_headers", 0);
 
+
+    av_opt_set(odata, "mpegts_flags", "+resend_headers", 0);
+    av_opt_set(odata, "mpegts_flags", "+no_key_pat_pmt", 0);
+    av_opt_set_int(odata, "pes_payload_size", c->payload_size, 0);
+    av_opt_set_int(odata, "mpegts_sdt_period", -1, 0);
+    av_opt_set_int(odata, "mpegts_pat_period", -1, 0);
+    
     return 0;
 }
 
@@ -321,6 +334,7 @@ static const AVOption options[] = {
     {"start_number",  "set first number in the sequence",        OFFSET(sequence),AV_OPT_TYPE_INT64,  {.i64 = 0},     0, INT64_MAX, E},
     {"hls_time",      "set segment length in seconds",           OFFSET(time),    AV_OPT_TYPE_FLOAT,  {.dbl = 2},     0, FLT_MAX, E},
     {"hls_list_size", "set maximum number of playlist entries",  OFFSET(size),    AV_OPT_TYPE_INT,    {.i64 = 5},     0, INT_MAX, E},
+    {"hls_payload_size", "set payload size",  OFFSET(payload_size),    AV_OPT_TYPE_INT,    {.i64 = 2930},     0, INT_MAX, E},
     {"hls_wrap",      "set number after which the index wraps",  OFFSET(wrap),    AV_OPT_TYPE_INT,    {.i64 = 0},     0, INT_MAX, E},
     { NULL },
 };
@@ -346,3 +360,4 @@ AVOutputFormat ff_hls_muxer = {
     .write_trailer  = hls_write_trailer,
     .priv_class     = &hls_class,
 };
+
