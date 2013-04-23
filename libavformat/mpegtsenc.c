@@ -63,6 +63,7 @@ typedef struct MpegTSWrite {
     int sdt_packet_period;
     int pat_packet_count;
     int pat_packet_period;
+    int pat_pmt_on_key;
     int nb_services;
     int onid;
     int tsid;
@@ -82,6 +83,7 @@ typedef struct MpegTSWrite {
 
 #define MPEGTS_FLAG_REEMIT_PAT_PMT  0x01
 #define MPEGTS_FLAG_AAC_LATM        0x02
+#define MPEGTS_FLAG_NO_KEY_PAT_PMT  0x04
     int flags;
     int copyts;
 } MpegTSWrite;
@@ -107,6 +109,10 @@ static const AVOption options[] = {
     { "muxrate", NULL, offsetof(MpegTSWrite, mux_rate), AV_OPT_TYPE_INT, {.i64 = 1}, 0, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM},
     { "pes_payload_size", "Minimum PES packet payload in bytes",
       offsetof(MpegTSWrite, pes_payload_size), AV_OPT_TYPE_INT, {.i64 = DEFAULT_PES_PAYLOAD_SIZE}, 0, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM},
+    { "mpegts_sdt_period", "SDT packet period",
+      offsetof(MpegTSWrite, sdt_packet_period), AV_OPT_TYPE_INT, {.i64 = 200}, -1, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM},
+    { "mpegts_pat_period", "PAT packet period",
+      offsetof(MpegTSWrite, pat_packet_period), AV_OPT_TYPE_INT, {.i64 = 40}, -1, INT_MAX, AV_OPT_FLAG_ENCODING_PARAM},
     { "mpegts_flags", "MPEG-TS muxing flags", offsetof(MpegTSWrite, flags), AV_OPT_TYPE_FLAGS, {.i64 = 0}, 0, INT_MAX,
       AV_OPT_FLAG_ENCODING_PARAM, "mpegts_flags" },
     { "resend_headers", "Reemit PAT/PMT before writing the next packet",
@@ -114,6 +120,9 @@ static const AVOption options[] = {
       AV_OPT_FLAG_ENCODING_PARAM, "mpegts_flags"},
     { "latm", "Use LATM packetization for AAC",
       0, AV_OPT_TYPE_CONST, {.i64 = MPEGTS_FLAG_AAC_LATM}, 0, INT_MAX,
+      AV_OPT_FLAG_ENCODING_PARAM, "mpegts_flags"},
+    { "no_key_pat_pmt", "Don't emit PAT/PMT on keyframes",
+      0, AV_OPT_TYPE_CONST, {.i64 = MPEGTS_FLAG_NO_KEY_PAT_PMT}, 0, INT_MAX,
       AV_OPT_FLAG_ENCODING_PARAM, "mpegts_flags"},
     // backward compatibility
     { "resend_headers", "Reemit PAT/PMT before writing the next packet",
@@ -642,9 +651,6 @@ static int mpegts_write_header(AVFormatContext *s)
         if(ts->copyts < 1)
             ts->first_pcr = av_rescale(s->max_delay, PCR_TIME_BASE, AV_TIME_BASE);
     } else {
-        /* Arbitrary values, PAT/PMT will also be written on video key frames */
-        ts->sdt_packet_period = 200;
-        ts->pat_packet_period = 40;
         if (pcr_st->codec->codec_type == AVMEDIA_TYPE_AUDIO) {
             if (!pcr_st->codec->frame_size) {
                 av_log(s, AV_LOG_WARNING, "frame size not set\n");
@@ -715,7 +721,8 @@ static void retransmit_si_info(AVFormatContext *s, int force_pat)
 
     if (++ts->sdt_packet_count == ts->sdt_packet_period) {
         ts->sdt_packet_count = 0;
-        mpegts_write_sdt(s);
+        if (ts->sdt_packet_period >= 0)
+                mpegts_write_sdt(s);
     }
     if (++ts->pat_packet_count == ts->pat_packet_period || force_pat) {
         ts->pat_packet_count = 0;
@@ -846,7 +853,10 @@ static void mpegts_write_pes(AVFormatContext *s, AVStream *st,
     int afc_len, stuffing_len;
     int64_t pcr = -1; /* avoid warning */
     int64_t delay = av_rescale(s->max_delay, 90000, AV_TIME_BASE);
-    int force_pat = st->codec->codec_type == AVMEDIA_TYPE_VIDEO && key && !ts_st->prev_payload_key;
+    int force_pat = (ts->flags & MPEGTS_FLAG_NO_KEY_PAT_PMT) == 0
+            && st->codec->codec_type == AVMEDIA_TYPE_VIDEO 
+            && key 
+            && !ts_st->prev_payload_key;
 
     is_start = 1;
     while (payload_size > 0) {
