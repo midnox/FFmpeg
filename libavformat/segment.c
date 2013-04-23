@@ -249,7 +249,8 @@ static void segment_list_print_entry(AVIOContext      *list_ioctx,
         break;
     case LIST_TYPE_M3U8:
         avio_printf(list_ioctx, "#EXTINF:%f,\n%s\n",
-                    list_entry->end_time - list_entry->start_time, list_entry->filename);
+                    list_entry->end_time - list_entry->start_time, 
+                    av_basename(list_entry->filename));
         break;
     case LIST_TYPE_FFCONCAT:
     {
