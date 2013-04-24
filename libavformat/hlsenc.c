@@ -31,8 +31,8 @@
 #include "internal.h"
 
 typedef struct ListEntry {
-    char  name[1024];
-    int   duration;
+    char name[1024];
+    unsigned duration;
     struct ListEntry *next;
 } ListEntry;
 
@@ -50,7 +50,8 @@ typedef struct HLSContext {
     int has_video;
     int64_t start_pts;
     int64_t end_pts;
-    int64_t duration;      ///< last segment duration computed so far, in seconds
+    unsigned duration;      ///< last segment duration computed so far, in timebase units 
+    AVRational time_base;
     int nb_entries;
     ListEntry *list;
     ListEntry *end_list;
@@ -88,7 +89,7 @@ static int hls_mux_init(AVFormatContext *s)
     return 0;
 }
 
-static int append_entry(HLSContext *hls, uint64_t duration)
+static int append_entry(HLSContext *hls, unsigned duration)
 {
     ListEntry *en = av_malloc(sizeof(*en));
 
@@ -130,6 +131,11 @@ static void free_entries(HLSContext *hls)
     }
 }
 
+static double duration(int d, AVRational time_base) {
+        time_base.num *= d;
+        return av_q2d(time_base);
+}
+
 static int hls_window(AVFormatContext *s, int last)
 {
     HLSContext *hls = s->priv_data;
@@ -148,12 +154,14 @@ static int hls_window(AVFormatContext *s, int last)
 
     avio_printf(hls->pb, "#EXTM3U\n");
     avio_printf(hls->pb, "#EXT-X-VERSION:3\n");
-    avio_printf(hls->pb, "#EXT-X-TARGETDURATION:%d\n", target_duration);
+    avio_printf(hls->pb, "#EXT-X-TARGETDURATION:%d\n", 
+                (int)(ceil(duration(target_duration, hls->time_base))));
     avio_printf(hls->pb, "#EXT-X-MEDIA-SEQUENCE:%"PRId64"\n",
                 FFMAX(0, hls->sequence - hls->size));
 
     for (en = hls->list; en; en = en->next) {
-        avio_printf(hls->pb, "#EXTINF:%d,\n", en->duration);
+        avio_printf(hls->pb, "#EXTINF:%f,\n", 
+                    duration(en->duration, hls->time_base));
         avio_printf(hls->pb, "%s\n", en->name);
     }
 
@@ -167,17 +175,17 @@ fail:
 
 static int hls_start(AVFormatContext *s)
 {
-    HLSContext *c = s->priv_data;
-    AVFormatContext *oc = c->avf;
+    HLSContext *hls = s->priv_data;
+    AVFormatContext *oc = hls->avf;
     void * odata = oc->priv_data;
     int err = 0;
 
-    if (c->wrap)
-        c->number %= c->wrap;
+    if (hls->wrap)
+        hls->number %= hls->wrap;
 
     if (av_get_frame_filename(oc->filename, sizeof(oc->filename),
-                              c->basename, c->number++) < 0) {
-        av_log(oc, AV_LOG_ERROR, "Invalid segment filename template '%s'\n", c->basename);
+                              hls->basename, hls->number++) < 0) {
+        av_log(oc, AV_LOG_ERROR, "Invalid segment filename template '%s'\n", hls->basename);
         return AVERROR(EINVAL);
     }
 
@@ -185,11 +193,12 @@ static int hls_start(AVFormatContext *s)
                           &s->interrupt_callback, NULL)) < 0)
         return err;
 
+    hls->duration = 0;
 
 
     av_opt_set(odata, "mpegts_flags", "+resend_headers", 0);
     av_opt_set(odata, "mpegts_flags", "+no_key_pat_pmt", 0);
-    av_opt_set_int(odata, "pes_payload_size", c->payload_size, 0);
+    av_opt_set_int(odata, "pes_payload_size", hls->payload_size, 0);
     av_opt_set_int(odata, "mpegts_sdt_period", -1, 0);
     av_opt_set_int(odata, "mpegts_pat_period", -1, 0);
     
@@ -276,8 +285,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     if ((hls->has_video && st->codec->codec_type == AVMEDIA_TYPE_VIDEO)      &&
         pkt->pts != AV_NOPTS_VALUE) {
         is_ref_pkt = 1;
-        hls->duration = av_rescale(pkt->pts - hls->end_pts,
-                                   st->time_base.num, st->time_base.den);
+        hls->duration = pkt->pts - hls->end_pts;
+        hls->time_base = st->time_base;
     }
 
     if (is_ref_pkt &&
