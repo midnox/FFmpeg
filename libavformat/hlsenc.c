@@ -33,6 +33,7 @@
 typedef struct ListEntry {
     char name[1024];
     unsigned duration;
+    int64_t end;
     struct ListEntry *next;
 } ListEntry;
 
@@ -46,6 +47,8 @@ typedef struct HLSContext {
     int  size;             // Set by a private option.
     int  payload_size;     // Set by a private option.
     int  wrap;             // Set by a private option.
+    int  ifo;              // Set by a private option.     
+    int  br;               // Set by a private option.     
     int64_t recording_time;
     int has_video;
     int64_t start_pts;
@@ -92,6 +95,7 @@ static int hls_mux_init(AVFormatContext *s)
 static int append_entry(HLSContext *hls, unsigned duration)
 {
     ListEntry *en = av_malloc(sizeof(*en));
+    AVFormatContext *oc = hls->avf;
 
     if (!en)
         return AVERROR(ENOMEM);
@@ -99,6 +103,7 @@ static int append_entry(HLSContext *hls, unsigned duration)
     av_strlcpy(en->name, av_basename(hls->avf->filename), sizeof(en->name));
 
     en->duration = duration;
+    en->end = oc->pb->pos;
     en->next     = NULL;
 
     if (!hls->list)
@@ -132,8 +137,8 @@ static void free_entries(HLSContext *hls)
 }
 
 static double duration(int d, AVRational time_base) {
-        time_base.num *= d;
-        return av_q2d(time_base);
+	time_base.num *= d;
+	return av_q2d(time_base);
 }
 
 static int hls_window(AVFormatContext *s, int last)
@@ -142,6 +147,8 @@ static int hls_window(AVFormatContext *s, int last)
     ListEntry *en;
     int target_duration = 0;
     int ret = 0;
+    unsigned prevpos = 0;
+    unsigned prevdur = 0;
 
     if ((ret = avio_open2(&hls->pb, s->filename, AVIO_FLAG_WRITE,
                           &s->interrupt_callback, NULL)) < 0)
@@ -153,16 +160,28 @@ static int hls_window(AVFormatContext *s, int last)
     }
 
     avio_printf(hls->pb, "#EXTM3U\n");
-    avio_printf(hls->pb, "#EXT-X-VERSION:3\n");
+    avio_printf(hls->pb, "#EXT-X-VERSION:%d\n", hls->ifo | hls->br? 4 : 3);
+    if (hls->ifo)
+	    avio_printf(hls->pb, "#EXT-X-I-FRAMES-ONLY\n");
     avio_printf(hls->pb, "#EXT-X-TARGETDURATION:%d\n", 
-                (int)(ceil(duration(target_duration, hls->time_base))));
+		(int)(ceil(duration(target_duration, hls->time_base))));
     avio_printf(hls->pb, "#EXT-X-MEDIA-SEQUENCE:%"PRId64"\n",
                 FFMAX(0, hls->sequence - hls->size));
 
+    
     for (en = hls->list; en; en = en->next) {
-        avio_printf(hls->pb, "#EXTINF:%f,\n", 
-                    duration(en->duration, hls->time_base));
+	avio_printf(hls->pb, "#EXTINF:%f,\n", 
+		    duration(en->duration - prevdur, hls->time_base));
+	if (en->end < prevpos) {
+		prevpos = 0;
+		prevdur = 0;
+	}
+	if (hls->br)
+	    avio_printf(hls->pb, "#EXT-X-BYTERANGE:%d@%d\n", 
+			(int)(en->end - prevpos), (int)prevpos);
         avio_printf(hls->pb, "%s\n", en->name);
+	prevpos = en->end;
+	prevdur = en->duration;
     }
 
     if (last)
@@ -250,6 +269,7 @@ static int hls_write_header(AVFormatContext *s)
 
     av_strlcat(hls->basename, pattern, basename_size);
 
+
     if ((ret = hls_mux_init(s)) < 0)
         goto fail;
 
@@ -276,6 +296,7 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     AVStream *st = s->streams[pkt->stream_index];
     int64_t end_pts = hls->recording_time * hls->number;
     int ret, is_ref_pkt = 0;
+    int term, toolong;
 
     if (hls->start_pts == AV_NOPTS_VALUE) {
         hls->start_pts = pkt->pts;
@@ -286,25 +307,23 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
         pkt->pts != AV_NOPTS_VALUE) {
         is_ref_pkt = 1;
         hls->duration = pkt->pts - hls->end_pts;
-        hls->time_base = st->time_base;
+	hls->time_base = st->time_base;
     }
 
-    if (is_ref_pkt &&
-        av_compare_ts(pkt->pts - hls->start_pts, st->time_base,
-                      end_pts, AV_TIME_BASE_Q) >= 0 &&
-        pkt->flags & AV_PKT_FLAG_KEY) {
+    term = is_ref_pkt && pkt->flags & AV_PKT_FLAG_KEY;
+    toolong = av_compare_ts(pkt->pts - hls->start_pts, st->time_base,
+			   end_pts, AV_TIME_BASE_Q) >= 0;
+    if (term && toolong) {
 
-        ret = append_entry(hls, hls->duration);
+        av_write_frame(oc, NULL); /* Flush any buffered data */
+
+	ret = append_entry(hls, hls->duration);
+	hls->end_pts = pkt->pts;
+	avio_close(oc->pb);
         if (ret)
             return ret;
 
-        hls->end_pts = pkt->pts;
-        hls->duration = 0;
-
-        av_write_frame(oc, NULL); /* Flush any buffered data */
-        avio_close(oc->pb);
-
-        ret = hls_start(s);
+	ret = hls_start(s);
 
         if (ret)
             return ret;
@@ -316,7 +335,8 @@ static int hls_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     ret = ff_write_chained(oc, pkt->stream_index, pkt, s);
-
+    if (!ret && term && hls->ifo && hls->duration)
+        ret = append_entry(hls, hls->duration);
     return ret;
 }
 
@@ -324,12 +344,12 @@ static int hls_write_trailer(struct AVFormatContext *s)
 {
     HLSContext *hls = s->priv_data;
     AVFormatContext *oc = hls->avf;
-
+    
     av_write_trailer(oc);
+    append_entry(hls, hls->duration);
     avio_closep(&oc->pb);
     avformat_free_context(oc);
     av_free(hls->basename);
-    append_entry(hls, hls->duration);
     hls_window(s, 1);
 
     free_entries(hls);
@@ -345,6 +365,8 @@ static const AVOption options[] = {
     {"hls_list_size", "set maximum number of playlist entries",  OFFSET(size),    AV_OPT_TYPE_INT,    {.i64 = 5},     0, INT_MAX, E},
     {"hls_payload_size", "set payload size",  OFFSET(payload_size),    AV_OPT_TYPE_INT,    {.i64 = 2930},     0, INT_MAX, E},
     {"hls_wrap",      "set number after which the index wraps",  OFFSET(wrap),    AV_OPT_TYPE_INT,    {.i64 = 0},     0, INT_MAX, E},
+    {"hls_ifo",      "EXT-X-I-FRAMES-ONLY mode",  OFFSET(ifo),    AV_OPT_TYPE_INT,    {.i64 = 0},     0, INT_MAX, E},
+    {"hls_br",       "EXT-X-BYTERANGE mode",  OFFSET(br),    AV_OPT_TYPE_INT,    {.i64 = 0},     0, INT_MAX, E},
     { NULL },
 };
 
